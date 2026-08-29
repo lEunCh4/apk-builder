@@ -1,0 +1,237 @@
+name: Build Android APK
+
+run-name: ${{ github.event.inputs.repository }} ${{ github.event.inputs.branchName && format('{0}', github.event.inputs.branchName) }} ${{ github.event.inputs.subdir && format('[/{0}]', github.event.inputs.subdir) }} :${{ github.event.inputs.taskName }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Git repository URL"
+        required: true
+        default: "https://github.com/android/sunflower"
+
+      branchName:
+        description: "Git branch name [Optional]"
+        required: false
+        default: ""
+
+      subdir:
+        description: "Relative subdirectory path when the project is nested [Optional]"
+        required: false
+        default: ""
+
+      jdkVersion:
+        description: "OpenJDK version: 8, 17, 21, 25, …"
+        required: false
+        default: "17"
+
+      taskName:
+        description: "Gradle task name: assembleDebug, assembleRelease, etc."
+        required: false
+        default: "assembleRelease"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+
+      # ========================================
+      # Setup JDK
+      # ========================================
+      - name: Setup JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: "temurin"
+          java-version: ${{ github.event.inputs.jdkVersion }}
+
+      # ========================================
+      # Get project name
+      # ========================================
+      - name: Get project name
+        id: project
+        run: |
+          REPO_URL="${{ github.event.inputs.repository }}"
+
+          PROJECT_NAME=$(basename -s .git "$REPO_URL")
+
+          if [ -z "$PROJECT_NAME" ]; then
+            echo "ERROR: Could not determine project name."
+            exit 1
+          fi
+
+          echo "Project name: $PROJECT_NAME"
+
+          echo "name=$PROJECT_NAME" >> "$GITHUB_OUTPUT"
+
+      # ========================================
+      # Clone project
+      # ========================================
+      - name: Clone project
+        run: |
+          if [[ -z "${{ github.event.inputs.branchName }}" ]]; then
+            git clone \
+              --recurse-submodules \
+              --depth=1 \
+              "${{ github.event.inputs.repository }}" \
+              workspace
+          else
+            git clone \
+              --recurse-submodules \
+              --depth=1 \
+              --branch "${{ github.event.inputs.branchName }}" \
+              "${{ github.event.inputs.repository }}" \
+              workspace
+          fi
+
+      # ========================================
+      # Build APK
+      # ========================================
+      - name: Build APK
+        working-directory: ./workspace/${{ github.event.inputs.subdir }}
+        run: |
+          if [ ! -f "gradlew" ]; then
+            echo "gradlew not found, generating Gradle wrapper..."
+            gradle wrapper
+          fi
+
+          chmod +x gradlew
+
+          if [[ "${{ github.event.inputs.taskName }}" == *Release* ]]; then
+            echo "Release build detected."
+
+            if [ ! -f "$HOME/.android/debug.keystore" ]; then
+              echo "Creating debug keystore..."
+
+              mkdir -p "$HOME/.android"
+
+              keytool -genkey -v \
+                -keystore "$HOME/.android/debug.keystore" \
+                -storepass android \
+                -alias androiddebugkey \
+                -keypass android \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -dname "C=US, O=Android, CN=Android Debug"
+            fi
+
+            ./gradlew ${{ github.event.inputs.taskName }} \
+              -Pandroid.injected.signing.store.file="$HOME/.android/debug.keystore" \
+              -Pandroid.injected.signing.store.password=android \
+              -Pandroid.injected.signing.key.alias=androiddebugkey \
+              -Pandroid.injected.signing.key.password=android \
+              --stacktrace
+
+          else
+            ./gradlew ${{ github.event.inputs.taskName }} --stacktrace
+          fi
+
+      # ========================================
+      # Find APK
+      # ========================================
+      - name: Find APK
+        run: |
+          echo "========================================"
+          echo "Generated APK files:"
+          echo "========================================"
+
+          find workspace \
+            -type f \
+            -name "*.apk" \
+            -print
+
+      # ========================================
+      # Verify APK exists
+      # ========================================
+      - name: Verify APK
+        run: |
+          APK_COUNT=$(find workspace -type f -name "*.apk" | wc -l)
+
+          if [ "$APK_COUNT" -eq 0 ]; then
+            echo "ERROR: No APK was generated."
+            exit 1
+          fi
+
+          echo "Found $APK_COUNT APK file(s)."
+
+      # ========================================
+      # Prepare APK files
+      # ========================================
+      - name: Prepare APK files
+        run: |
+          mkdir -p release-files
+
+          PROJECT="${{ steps.project.outputs.name }}"
+
+          COUNT=0
+
+          while IFS= read -r APK; do
+            COUNT=$((COUNT + 1))
+
+            BASENAME=$(basename "$APK")
+
+            # Remove spaces and make filename safe
+            SAFE_NAME=$(echo "$BASENAME" | tr ' ' '-' | tr -cd '[:alnum:]._-')
+
+            # First APK gets the simple project name
+            if [ "$COUNT" -eq 1 ]; then
+              NEW_NAME="${PROJECT}-${SAFE_NAME}"
+            else
+              NEW_NAME="${PROJECT}-${COUNT}-${SAFE_NAME}"
+            fi
+
+            cp "$APK" "release-files/$NEW_NAME"
+
+            echo "Added: $NEW_NAME"
+
+          done < <(find workspace -type f -name "*.apk")
+
+          echo "========================================"
+          echo "Release files:"
+          echo "========================================"
+
+          ls -lh release-files/
+
+      # ========================================
+      # Upload Actions Artifact
+      # ========================================
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.project.outputs.name }}-apk
+          path: release-files/*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      # ========================================
+      # Create GitHub Release
+      # ========================================
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "${{ steps.project.outputs.name }}-build-${{ github.run_number }}"
+          name: "📱 ${{ steps.project.outputs.name }} — Build #${{ github.run_number }}"
+          body: |
+            # ${{ steps.project.outputs.name }}
+
+            Automated Android APK build.
+
+            ## Build Information
+
+            | Property | Value |
+            |---|---|
+            | Project | `${{ steps.project.outputs.name }}` |
+            | Source | `${{ github.event.inputs.repository }}` |
+            | Branch | `${{ github.event.inputs.branchName || 'default branch' }}` |
+            | Gradle task | `${{ github.event.inputs.taskName }}` |
+            | JDK | `${{ github.event.inputs.jdkVersion }}` |
+            | Build | `#${{ github.run_number }}` |
+
+            APK generated automatically by GitHub Actions.
+
+          files: release-files/*.apk
+          fail_on_unmatched_files: true
